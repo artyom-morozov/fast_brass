@@ -1,0 +1,405 @@
+use crate::board::Board;
+use crate::board::connectivity::Connectivity;
+use crate::consts::STARTING_HAND_SIZE;
+use crate::core::locations::LocationName;
+use crate::core::player::Player;
+use crate::core::static_data::{INDUSTRY_MAT, LINK_LOCATIONS};
+use crate::core::types::*;
+use crate::game::framework::{ActionChoice, ActionIntent, ChoiceSet, GameFramework, ShortfallResolutionSession};
+
+#[derive(Debug, Clone)]
+struct TurnCheckpoint {
+    board_state: crate::board::state::BoardState,
+    actions_remaining_in_turn: u8,
+    discard_history_len: usize,
+}
+
+#[derive(Clone)]
+pub struct ReplayTurnCheckpoint {
+    board_state: crate::board::state::BoardState,
+    game_phase: GamePhase,
+    turn_count: u32,
+    round_in_phase: u32,
+    actions_remaining_in_turn: u8,
+    personal_turns_taken: Vec<u32>,
+    pending_shortfall_sessions: Vec<ShortfallResolutionSession>,
+    current_player: usize,
+    discard_history: Vec<DiscardHistoryEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscardHistoryEntry {
+    pub order: usize,
+    pub player_idx: usize,
+    pub round_in_phase: u32,
+    pub turn_count: u32,
+    pub card: Card,
+}
+
+#[derive(Clone)]
+pub struct GameRunner {
+    pub framework: GameFramework,
+    pub game_phase: GamePhase,
+    pub turn_count: u32,
+    pub round_in_phase: u32,
+    pub actions_remaining_in_turn: u8,
+    pub personal_turns_taken: Vec<u32>,
+    pub pending_shortfall_sessions: Vec<ShortfallResolutionSession>,
+    turn_checkpoints: Vec<TurnCheckpoint>,
+    turn_action_history: Vec<ActionIntent>,
+    discard_history: Vec<DiscardHistoryEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GamePhase {
+    Canal,
+    Railroad,
+    GameEnd,
+}
+
+impl GameRunner {
+    pub fn new(num_players: usize, seed: Option<u64>) -> Self {
+        let board = Board::new(num_players, seed);
+        let current_player = board.state.turn_order[0];
+        let framework = GameFramework::new(board, current_player);
+        Self {
+            framework,
+            game_phase: GamePhase::Canal,
+            turn_count: 0,
+            round_in_phase: 0,
+            actions_remaining_in_turn: 0,
+            personal_turns_taken: vec![0; num_players],
+            pending_shortfall_sessions: Vec::new(),
+            turn_checkpoints: Vec::new(),
+            turn_action_history: Vec::new(),
+            discard_history: Vec::new(),
+        }
+    }
+
+    pub fn start_turn(&mut self) -> Vec<ActionType> {
+        let player_idx = self.framework.current_player;
+        if self.actions_remaining_in_turn == 0 {
+            self.actions_remaining_in_turn =
+                if self.personal_turns_taken[player_idx] == 0 { 1 } else { 2 };
+            self.turn_checkpoints.clear();
+            self.turn_action_history.clear();
+        }
+        self.framework.get_valid_root_actions()
+    }
+
+    pub fn start_action(&mut self, action_type: ActionType) -> ChoiceSet {
+        let _ = self.framework.start_action_session(action_type);
+        self.framework.get_next_choice_set().unwrap_or(ChoiceSet::ConfirmOnly)
+    }
+
+    pub fn apply_choice(&mut self, choice: ActionChoice) -> Option<ChoiceSet> {
+        let _ = self.framework.apply_action_choice(choice);
+        self.framework.get_next_choice_set()
+    }
+
+    pub fn confirm_action(&mut self) -> Result<(), String> {
+        let session = self
+            .framework
+            .current_session()
+            .ok_or_else(|| "No active action session".to_string())?;
+        let discard_len_before = self.framework.board.state.discard_pile.len();
+        self.turn_checkpoints.push(TurnCheckpoint {
+            board_state: self.framework.board.state.clone(),
+            actions_remaining_in_turn: self.actions_remaining_in_turn,
+            discard_history_len: self.discard_history.len(),
+        });
+        self.framework.confirm_action_session()?;
+        let discard_len_after = self.framework.board.state.discard_pile.len();
+        if discard_len_after > discard_len_before {
+            for card in self.framework.board.state.discard_pile[discard_len_before..discard_len_after].iter().cloned() {
+                let entry = DiscardHistoryEntry {
+                    order: self.discard_history.len(),
+                    player_idx: self.framework.current_player,
+                    round_in_phase: self.round_in_phase,
+                    turn_count: self.turn_count,
+                    card,
+                };
+                self.discard_history.push(entry);
+            }
+        }
+        self.turn_action_history.push(session.intent);
+        self.end_action_slot();
+        Ok(())
+    }
+
+    pub fn undo_last_confirmed_action(&mut self) -> Result<(), String> {
+        let Some(checkpoint) = self.turn_checkpoints.pop() else {
+            return Err("No previously confirmed action to undo this turn".to_string());
+        };
+        self.framework.cancel_action_session();
+        self.framework.board.state = checkpoint.board_state;
+        self.actions_remaining_in_turn = checkpoint.actions_remaining_in_turn;
+        self.discard_history.truncate(checkpoint.discard_history_len);
+        self.turn_action_history.pop();
+        Ok(())
+    }
+
+    pub fn turn_action_history(&self) -> &Vec<ActionIntent> {
+        &self.turn_action_history
+    }
+
+    pub fn discard_history(&self) -> &Vec<DiscardHistoryEntry> {
+        &self.discard_history
+    }
+
+    pub fn end_action_slot(&mut self) {
+        if self.actions_remaining_in_turn > 0 {
+            self.actions_remaining_in_turn -= 1;
+        }
+    }
+
+    pub fn end_turn(&mut self) {
+        self.turn_checkpoints.clear();
+        self.turn_action_history.clear();
+        self.finish_turn_and_advance();
+    }
+
+    pub fn checkpoint_replay_turn(&self) -> ReplayTurnCheckpoint {
+        ReplayTurnCheckpoint {
+            board_state: self.framework.board.state.clone(),
+            game_phase: self.game_phase,
+            turn_count: self.turn_count,
+            round_in_phase: self.round_in_phase,
+            actions_remaining_in_turn: self.actions_remaining_in_turn,
+            personal_turns_taken: self.personal_turns_taken.clone(),
+            pending_shortfall_sessions: self.pending_shortfall_sessions.clone(),
+            current_player: self.framework.current_player,
+            discard_history: self.discard_history.clone(),
+        }
+    }
+
+    pub fn restore_replay_turn(&mut self, checkpoint: ReplayTurnCheckpoint) {
+        self.framework.board.state = checkpoint.board_state;
+        self.game_phase = checkpoint.game_phase;
+        self.turn_count = checkpoint.turn_count;
+        self.round_in_phase = checkpoint.round_in_phase;
+        self.actions_remaining_in_turn = checkpoint.actions_remaining_in_turn;
+        self.personal_turns_taken = checkpoint.personal_turns_taken;
+        self.pending_shortfall_sessions = checkpoint.pending_shortfall_sessions;
+        self.framework.current_player = checkpoint.current_player;
+        self.discard_history = checkpoint.discard_history;
+        self.framework.cancel_action_session();
+        self.turn_checkpoints.clear();
+        self.turn_action_history.clear();
+    }
+
+    pub fn finish_turn_and_advance(&mut self) {
+        let player_idx = self.framework.current_player;
+        self.personal_turns_taken[player_idx] += 1;
+        self.turn_count += 1;
+
+        let current_turn_pos = self
+            .framework
+            .board
+            .state
+            .turn_order
+            .iter()
+            .position(|p| *p == player_idx)
+            .unwrap_or(0);
+        let next_turn_pos = (current_turn_pos + 1) % self.framework.board.state.turn_order.len();
+        let wrapped = next_turn_pos == 0;
+
+        if wrapped {
+            self.end_round();
+            // Turn order may have changed; start from the new first player
+            self.framework.current_player = self.framework.board.state.turn_order[0];
+        } else {
+            self.framework.current_player = self.framework.board.state.turn_order[next_turn_pos];
+        }
+    }
+
+    pub fn end_round(&mut self) {
+        self.round_in_phase += 1;
+
+        let num_players = self.framework.board.state.players.len();
+        for player_idx in 0..num_players {
+            self.resolve_income_shortfall_for_player(player_idx);
+        }
+
+        self.draw_cards_for_all_players();
+        self.framework.board.turn_order_next();
+        self.try_phase_transition();
+    }
+
+    fn draw_cards_for_all_players(&mut self) {
+        let hand_limit = STARTING_HAND_SIZE as usize;
+        let num_players = self.framework.board.state.players.len();
+        for player_idx in 0..num_players {
+            let current_hand_size = self.framework.board.state.players[player_idx].hand.cards.len();
+            if current_hand_size < hand_limit {
+                let cards_needed = hand_limit - current_hand_size;
+                if !self.framework.board.state.deck.is_empty() {
+                    let drawn = self.framework.board.state.deck.draw_n(cards_needed);
+                    for card in drawn {
+                        self.framework.board.state.players[player_idx].hand.add_card(card);
+                    }
+                }
+            }
+        }
+    }
+
+    fn try_phase_transition(&mut self) {
+        if self.game_phase == GamePhase::Canal && self.round_in_phase >= Self::rounds_per_era(self.framework.board.players().len()) {
+            self.game_phase = GamePhase::Railroad;
+            self.framework.board.state.era = Era::Railroad;
+            self.round_in_phase = 0;
+            self.end_era();
+        } else if self.game_phase == GamePhase::Railroad
+            && self.round_in_phase >= Self::rounds_per_era(self.framework.board.players().len())
+        {
+            self.game_phase = GamePhase::GameEnd;
+            self.end_era();
+        }
+    }
+
+    pub fn end_era(&mut self) {
+        let state = &mut self.framework.board.state;
+        let num_players = state.players.len();
+
+        // Score roads: for each road, the owner gets VPs equal to the sum
+        // of road_vp for every building present in the road's connected locations.
+        let built_road_indices: Vec<usize> = state.built_roads.ones().collect();
+        for road_idx in built_road_indices {
+            let mut road_owner = None;
+            for p_idx in 0..num_players {
+                if state.player_road_mask[p_idx].contains(road_idx) {
+                    road_owner = Some(p_idx);
+                    break;
+                }
+            }
+
+            if let Some(owner_idx) = road_owner {
+                let mut road_vps: u16 = 0;
+                for loc_idx in LINK_LOCATIONS[road_idx].locations.ones() {
+                    let bl_set = LocationName::from_usize(loc_idx).to_bl_set();
+                    for bl_idx in bl_set.ones() {
+                        if let Some(building) = state.bl_to_building.get(&bl_idx) {
+                            let data = &INDUSTRY_MAT[building.industry as usize][building.level.as_usize()];
+                            road_vps += data.road_vp as u16;
+                        }
+                    }
+                }
+                state.players[owner_idx].victory_points += road_vps;
+                state.visible_vps[owner_idx] += road_vps;
+            }
+        }
+
+        // Score all flipped buildings: each flipped building awards its
+        // vp_on_flip to the owning player.
+        for building in state.bl_to_building.values() {
+            if building.flipped {
+                let data = &INDUSTRY_MAT[building.industry as usize][building.level.as_usize()];
+                let owner_idx = building.owner.as_usize();
+                state.players[owner_idx].victory_points += data.vp_on_flip as u16;
+                state.visible_vps[owner_idx] += data.vp_on_flip as u16;
+            }
+        }
+
+        // Canal-to-Railroad transition: remove level 1 tiles and all roads,
+        // then reset connectivity.
+        if self.game_phase == GamePhase::Railroad {
+            let to_remove: Vec<usize> = state
+                .bl_to_building
+                .iter()
+                .filter(|(_, b)| {
+                    INDUSTRY_MAT[b.industry as usize][b.level.as_usize()].removed_after_phase1
+                })
+                .map(|(&loc, _)| loc)
+                .collect();
+
+            for loc_idx in to_remove {
+                state.remove_building_from_board(loc_idx);
+            }
+
+            state.built_roads.clear();
+            for p_idx in 0..num_players {
+                state.player_road_mask[p_idx].clear();
+            }
+
+            state.connectivity = Connectivity::new();
+            for p_idx in 0..num_players {
+                state.player_network_mask[p_idx] = Connectivity::new();
+                state.players[p_idx].network = Connectivity::new();
+            }
+        }
+    }
+
+    fn rounds_per_era(num_players: usize) -> u32 {
+        match num_players {
+            2 => 10,
+            3 => 9,
+            4 => 8,
+            _ => 8,
+        }
+    }
+
+    pub fn resolve_income_shortfall_for_player(&mut self, player_idx: usize) {
+        let player = &self.framework.board.state.players[player_idx];
+        let income = player.get_income_amount(player.income_level);
+        if income >= 0 {
+            self.framework.board.state.players[player_idx].gain_money(income as u16);
+            return;
+        }
+
+        let debt = income.unsigned_abs() as u16;
+        if player.money >= debt {
+            self.framework.board.state.players[player_idx].money =
+                self.framework.board.state.players[player_idx].money.saturating_sub(debt);
+            return;
+        }
+
+        let shortfall = debt - player.money;
+        self.framework.board.state.players[player_idx].money = 0;
+        let session = self
+            .framework
+            .start_shortfall_resolution_session(player_idx, shortfall);
+        self.pending_shortfall_sessions.push(session);
+    }
+
+    pub fn has_pending_shortfall(&self) -> bool {
+        !self.pending_shortfall_sessions.is_empty()
+    }
+
+    pub fn take_shortfall_sessions(&mut self) -> Vec<ShortfallResolutionSession> {
+        std::mem::take(&mut self.pending_shortfall_sessions)
+    }
+
+    pub fn resolve_shortfall_with_tiles(
+        &mut self,
+        session: ShortfallResolutionSession,
+        chosen_tile_order: Vec<usize>,
+    ) {
+        self.framework
+            .resolve_shortfall_with_tile_choices(session, chosen_tile_order);
+    }
+
+    pub fn get_game_state(&self) -> GameState {
+        GameState {
+            current_player: self.framework.current_player,
+            phase: self.game_phase,
+            turn_count: self.turn_count,
+            players: self.framework.board.players().clone(),
+            actions_remaining_in_turn: self.actions_remaining_in_turn,
+            round_in_phase: self.round_in_phase,
+        }
+    }
+
+    pub fn is_game_finished(&self) -> bool {
+        self.game_phase == GamePhase::GameEnd
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GameState {
+    pub current_player: usize,
+    pub phase: GamePhase,
+    pub turn_count: u32,
+    pub players: Vec<Player>,
+    pub actions_remaining_in_turn: u8,
+    pub round_in_phase: u32,
+}

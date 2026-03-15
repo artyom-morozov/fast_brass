@@ -1,0 +1,251 @@
+import { get } from 'svelte/store';
+import {
+	gameState, turnPhase, actionsAvailable, logMessage,
+	moneyAtTurnStart, snapshotMoney, currentAction, playerName,
+	allIndustryData, actionBudgetAtTurnStart
+} from './store';
+import type { GameState } from './types';
+
+const ACTION_LABELS: Record<string, string> = {
+	BuildBuilding: 'Build', BuildRailroad: 'Network', BuildDoubleRailroad: 'Double Rail',
+	Develop: 'Develop', DevelopDouble: 'Develop x2', Sell: 'Sell',
+	Loan: 'Loan', Scout: 'Scout', Pass: 'Pass'
+};
+
+const CHOICE_LABELS: Record<string, string> = {
+	industry: 'industry', card: 'card', build_location: 'location',
+	road: 'road', second_road: '2nd road', coal_source: 'coal source',
+	iron_source: 'iron source', beer_source: 'beer source',
+	action_beer_source: 'beer', sell_target: 'sell target',
+	free_development: 'free develop', second_industry: 'second industry', network_mode: 'network mode', confirm: 'confirm'
+};
+
+export interface SavedGameSummary {
+	id: number;
+	created_at: number;
+	round_in_phase: number;
+	era: string;
+	num_players: number;
+	seed: number;
+}
+
+let lastTurnPlayer: number | null = null;
+let currentTurnActionBudget = 1;
+
+function cpName(): string {
+	const gs = get(gameState);
+	return gs ? playerName(gs, gs.current_player) : '???';
+}
+
+export function applyLoadedState(state: GameState) {
+	gameState.set(state);
+	currentAction.set(null);
+	lastTurnPlayer = state.current_player;
+	currentTurnActionBudget = Math.max(1, state.actions_remaining);
+	actionBudgetAtTurnStart.set(currentTurnActionBudget);
+	if (state.choice_set) {
+		turnPhase.set('in_session');
+		actionsAvailable.set(null);
+	} else if (state.actions_remaining <= 0) {
+		turnPhase.set('turn_done');
+		actionsAvailable.set(null);
+	} else {
+		turnPhase.set('choosing_action');
+		actionsAvailable.set(state.available_actions || []);
+	}
+	loadIndustryData();
+}
+
+export async function api(endpoint: string, body?: unknown): Promise<any> {
+	const opts: RequestInit = { method: body !== undefined ? 'POST' : 'GET' };
+	if (body !== undefined) {
+		opts.headers = { 'Content-Type': 'application/json' };
+		opts.body = JSON.stringify(body);
+	}
+	const postNoBody = ['start_turn', 'confirm_action', 'cancel_action', 'undo_last_action', 'end_turn'];
+	if (!opts.method || (opts.method === 'GET' && postNoBody.includes(endpoint))) {
+		opts.method = 'POST';
+	}
+	try {
+		const res = await fetch('/api/' + endpoint, opts);
+		if (!res.ok) { logMessage(`Server error: ${res.status}`); return null; }
+		const text = await res.text();
+		if (!text) { logMessage('Empty response'); return null; }
+		const data = JSON.parse(text);
+		if (!data.ok) { logMessage('Error: ' + (data.error || 'unknown')); return null; }
+		if (data.state) gameState.set(data.state);
+		return data;
+	} catch (e: any) {
+		logMessage('Network error: ' + e.message);
+		return null;
+	}
+}
+
+export async function loadIndustryData() {
+	try {
+		const res = await fetch('/api/industry_data');
+		const json = await res.json();
+		if (json.ok && json.data) allIndustryData.set(json.data);
+	} catch { /* non-critical */ }
+}
+
+export async function listSavedGames(): Promise<SavedGameSummary[]> {
+	const data = await api('games');
+	return data?.games ?? [];
+}
+
+export async function loadGame(gameId: number) {
+	const data = await api('load_game', { game_id: gameId });
+	if (data?.state) {
+		applyLoadedState(data.state as GameState);
+		logMessage(`Loaded game #${gameId}`);
+	}
+	return data;
+}
+
+export async function newGame(numPlayers: number, seed: number | null = null) {
+	const data = await api('new_game', { num_players: numPlayers, seed });
+	if (data?.state) {
+		applyLoadedState(data.state as GameState);
+		turnPhase.set('awaiting_start');
+		actionsAvailable.set(null);
+		lastTurnPlayer = null;
+		currentTurnActionBudget = 1;
+		actionBudgetAtTurnStart.set(1);
+		logMessage(`New game started with ${numPlayers} players`);
+	}
+	return data;
+}
+
+export async function startTurn() {
+	const name = cpName();
+	snapshotMoney();
+	const phaseBeforeStart = get(turnPhase);
+	const data = await api('start_turn');
+	if (data?.state) {
+		const state = data.state;
+		const currentPlayer = state.current_player as number;
+		const remaining = state.actions_remaining as number;
+		const isNewPersonalTurn = lastTurnPlayer !== currentPlayer || phaseBeforeStart === 'awaiting_start';
+		if (isNewPersonalTurn) {
+			currentTurnActionBudget = Math.max(1, remaining);
+			lastTurnPlayer = currentPlayer;
+		}
+		actionBudgetAtTurnStart.set(currentTurnActionBudget);
+		actionsAvailable.set(data.state.available_actions || []);
+		turnPhase.set('choosing_action');
+		currentAction.set(null);
+		logMessage(`${name}'s turn begins (£${data.state.players.find((p: any) => p.index === data.state.current_player)?.money ?? '?'})`);
+	}
+	return data;
+}
+
+export async function selectAction(actionType: string) {
+	const name = cpName();
+	const label = ACTION_LABELS[actionType] || actionType;
+	const data = await api('start_action', { action_type: actionType });
+	if (data) {
+		actionsAvailable.set(null);
+		turnPhase.set('in_session');
+		currentAction.set(actionType);
+		logMessage(`${name} chose action: ${label}`);
+	}
+	return data;
+}
+
+export async function applyChoice(kind: string, value: unknown) {
+	const name = cpName();
+	const gs = get(gameState);
+	const kindLabel = CHOICE_LABELS[kind] || kind;
+	let detail = String(value);
+
+	if (kind === 'card' && gs) {
+		const cp = gs.players.find(p => p.index === gs.current_player);
+		const card = cp?.hand.find(c => c.index === value);
+		if (card) detail = card.label;
+	}
+	if (kind === 'build_location' || kind === 'sell_target') {
+		const cs = gs?.choice_set;
+		const opt = cs?.options.find(o => o.value === value);
+		if (opt) detail = opt.label;
+	}
+
+	const data = await api('apply_choice', { choice_kind: kind, value });
+	if (data) {
+		logMessage(`${name} picked ${kindLabel}: ${detail}`);
+	}
+	return data;
+}
+
+export async function confirmAction() {
+	const name = cpName();
+	const action = get(currentAction);
+	const actionLabel = action ? (ACTION_LABELS[action] || action) : 'action';
+	const moneyBefore = get(moneyAtTurnStart);
+	const data = await api('confirm_action');
+	if (data) {
+		const gs = data.state;
+		const cp = gs.players.find((p: any) => p.index === gs.current_player);
+		const spent = moneyBefore[gs.current_player] != null
+			? moneyBefore[gs.current_player] - (cp?.money ?? 0)
+			: 0;
+		const spentStr = spent > 0 ? ` (spent £${spent})` : spent < 0 ? ` (gained £${-spent})` : '';
+		logMessage(`${name} confirmed ${actionLabel}${spentStr}`);
+		currentAction.set(null);
+		if (gs.actions_remaining > 0) {
+			return startTurn();
+		} else {
+			turnPhase.set('turn_done');
+		}
+	}
+	return data;
+}
+
+export async function cancelAction() {
+	const name = cpName();
+	const action = get(currentAction);
+	const actionLabel = action ? (ACTION_LABELS[action] || action) : 'action';
+	const data = await api('cancel_action');
+	if (data) {
+		logMessage(`${name} cancelled ${actionLabel}`);
+		currentAction.set(null);
+		return startTurn();
+	}
+	return data;
+}
+
+export async function undoLastAction() {
+	const name = cpName();
+	const data = await api('undo_last_action');
+	if (data) {
+		turnPhase.set('choosing_action');
+		currentAction.set(null);
+		actionsAvailable.set(data.state?.available_actions || []);
+		logMessage(`${name} undid previous confirmed action`);
+	}
+	return data;
+}
+
+export async function endTurn() {
+	const name = cpName();
+	const moneyBefore = get(moneyAtTurnStart);
+	const gs = get(gameState);
+	let spentStr = '';
+	if (gs) {
+		const cp = gs.players.find(p => p.index === gs.current_player);
+		if (cp && moneyBefore[cp.index] != null) {
+			const delta = moneyBefore[cp.index] - cp.money;
+			if (delta > 0) spentStr = ` — spent £${delta} total this turn`;
+			else if (delta < 0) spentStr = ` — gained £${-delta} total this turn`;
+		}
+	}
+	const data = await api('end_turn');
+	if (data) {
+		actionsAvailable.set(null);
+		turnPhase.set('awaiting_start');
+		currentAction.set(null);
+		lastTurnPlayer = null;
+		logMessage(`${name} ended turn${spentStr}`);
+	}
+	return data;
+}
